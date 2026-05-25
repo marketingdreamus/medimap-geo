@@ -1,0 +1,72 @@
+name: Auto-publish content (cron)
+
+# Streamlit Cloud 슬립으로 APScheduler 가 멈춰도 GH Actions 가 매 시간 트리거.
+# 새벽 3시 KST = 18:00 UTC. 1일 1회만 돌리던 패턴을 매 시간으로 확장 (daily_count
+# 카운트 자체는 auto_content_settings.daily_count 가 결정).
+#
+# 필요 secrets:
+#   DATABASE_URL              postgres://...@aws-1-ap-northeast-2.pooler.supabase.com:6543/postgres
+#   GEMINI_API_KEY            Google AI Studio 키 (LLM_PROVIDER=gemini 일 때)
+#   LLM_PROVIDER              gemini | openai | anthropic | stub (기본 stub)
+#   OPENAI_API_KEY            (선택)
+#   ANTHROPIC_API_KEY         (선택)
+#   MAX_DAILY_USD             cost guardrail (기본 10)
+
+on:
+  schedule:
+    # 매 시간 정각 (UTC). 한국 시간 9시,10시,...,8시. cron expression 6필드 X 5필드 O
+    - cron: '0 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # 동시 실행 차단 — 중복 콘텐츠 생성 방지
+  group: auto-publish
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Generate + publish 1 cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify required secrets
+        run: |
+          if [ -z "${{ secrets.DATABASE_URL }}" ]; then
+            echo "::error::DATABASE_URL secret 미설정"
+            exit 1
+          fi
+
+      - name: Run daily_auto_content_job
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LLM_PROVIDER: ${{ secrets.LLM_PROVIDER || 'stub' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MAX_DAILY_USD: ${{ secrets.MAX_DAILY_USD || '10' }}
+        run: python scripts/run_auto_content_once.py
+
+      - name: Trigger Vercel deploy hook (medimap-blog ISR cache 무효화)
+        if: success() && env.VERCEL_DEPLOY_HOOK != ''
+        env:
+          VERCEL_DEPLOY_HOOK: ${{ secrets.VERCEL_DEPLOY_HOOK }}
+        run: |
+          curl -sS -X POST "$VERCEL_DEPLOY_HOOK" || true

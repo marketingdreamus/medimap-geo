@@ -1,0 +1,1525 @@
+From c2ca92d4b87f9ce385e182681b3a234c2fbdc8d8 Mon Sep 17 00:00:00 2001
+From: Claude <claude@medimap.local>
+Date: Mon, 25 May 2026 02:43:02 +0000
+Subject: [PATCH] =?UTF-8?q?feat(v2):=20=EB=AA=A8=EB=93=A0=20=EB=A9=94?=
+ =?UTF-8?q?=EB=89=B4=20=ED=8E=98=EC=9D=B4=EC=A7=80=20=EC=9D=B8=ED=84=B0?=
+ =?UTF-8?q?=EB=9E=99=ED=8B=B0=EB=B8=8C=ED=99=94=20=E2=80=94=20dead=20butto?=
+ =?UTF-8?q?n=200=EA=B1=B4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 신규 API 라우트 3종 (/api/simulator/compare, /api/blog/generate, /api/video/generate)
+- src/lib/clientActions.ts — clipboard/download/toast 공통 유틸
+- / (dashboard): PDF 다운로드 → window.print()
+- /data-feeding: form state + localStorage + 필수필드 검증 + X close/restore
+- /simulator: 4 엔진 동시 호출 + thread 전환 + suggestion 클릭
+- /ai-code: .html 다운로드 + 토스트 피드백
+- /faq: 본문 복사 / 검수 / 발행 + AI 추가 모달
+- /blog: 5글 생성 + 본문 복사 + .md 묶음 다운로드 + 네이버 발행 상태 토글
+- /video: 스크립트 생성 + 복사 + 업로드 상태 토글
+---
+ src/app/ai-code/page.tsx               |  27 ++--
+ src/app/api/blog/generate/route.ts     |  52 ++++++++
+ src/app/api/simulator/compare/route.ts |  63 ++++++++++
+ src/app/api/video/generate/route.ts    |  69 +++++++++++
+ src/app/blog/page.tsx                  | 164 ++++++++++++++++++++-----
+ src/app/data-feeding/page.tsx          | 161 +++++++++++++++++-------
+ src/app/faq/page.tsx                   | 146 ++++++++++++++++++----
+ src/app/page.tsx                       |  11 +-
+ src/app/simulator/page.tsx             |  96 +++++++++++----
+ src/app/video/page.tsx                 |  93 ++++++++++++--
+ src/lib/clientActions.ts               | 127 +++++++++++++++++++
+ 11 files changed, 869 insertions(+), 140 deletions(-)
+ create mode 100755 src/app/api/blog/generate/route.ts
+ create mode 100755 src/app/api/simulator/compare/route.ts
+ create mode 100755 src/app/api/video/generate/route.ts
+ create mode 100755 src/lib/clientActions.ts
+
+diff --git a/src/app/ai-code/page.tsx b/src/app/ai-code/page.tsx
+index aef38fc..5121436 100644
+--- a/src/app/ai-code/page.tsx
++++ b/src/app/ai-code/page.tsx
+@@ -1,11 +1,7 @@
+ /**
+  * AI 코드 (JSON-LD) — Schema.org 자동 합성.
+  * Figma 시안(node 804:401) IA 100% 싱크로.
+- *
+- * 사용자 목표(LLM 인용 유도)에서 가장 중요한 페이지 중 하나 —
+- * 구조화 데이터 없으면 LLM이 자사 정보를 식별하지 못한다.
+  */
+-
+ 'use client';
+ 
+ import { useMemo, useState } from 'react';
+@@ -14,6 +10,7 @@ import { Header } from '@/components/Header';
+ import { schemaEntities } from '@/lib/mock-data';
+ import { tokenizeJson } from '@/lib/aeo';
+ import { cn } from '@/lib/cn';
++import { copyToClipboard, downloadJsonLdHtml, showToast } from '@/lib/clientActions';
+ 
+ const KPIS = [
+   { label: '활성 엔티티', value: '5 / 6', unit: '개' },
+@@ -33,13 +30,25 @@ export default function AiCodePage() {
+   };
+ 
+   const copyJson = async () => {
++    if (payloads.length === 0) {
++      showToast('활성 엔티티가 없습니다', { kind: 'error' });
++      return;
++    }
+     const raw = JSON.stringify(payloads, null, 2);
+     const wrapped = `<script type="application/ld+json">\n${raw}\n</script>`;
+-    try {
+-      await navigator.clipboard.writeText(wrapped);
+-    } catch {
+-      /* clipboard 권한 부재 환경 대비 — silent */
++    const ok = await copyToClipboard(wrapped);
++    showToast(ok ? `JSON-LD ${payloads.length}개 엔티티 복사됨` : '복사 실패', {
++      kind: ok ? 'success' : 'error'
++    });
++  };
++
++  const downloadHtml = () => {
++    if (payloads.length === 0) {
++      showToast('활성 엔티티가 없습니다. 토글을 켜주세요', { kind: 'error' });
++      return;
+     }
++    downloadJsonLdHtml(`medimap-geo-jsonld-${new Date().toISOString().slice(0, 10)}.html`, payloads);
++    showToast('.html 다운로드 시작');
+   };
+ 
+   return (
+@@ -111,7 +120,7 @@ export default function AiCodePage() {
+           <div className="flex items-center justify-between border-b border-border px-6 py-4">
+             <h2 className="section-title">JSON-LD 코드 미리보기</h2>
+             <div className="flex items-center gap-2">
+-              <button type="button" className="btn-secondary text-xs">
++              <button type="button" onClick={downloadHtml} className="btn-secondary text-xs">
+                 <Download className="h-3.5 w-3.5" /> .html 다운로드
+               </button>
+               <button type="button" onClick={copyJson} className="btn-primary text-xs">
+diff --git a/src/app/api/blog/generate/route.ts b/src/app/api/blog/generate/route.ts
+new file mode 100755
+index 0000000..15c11bd
+--- /dev/null
++++ b/src/app/api/blog/generate/route.ts
+@@ -0,0 +1,52 @@
++/**
++ * POST /api/blog/generate
++ *
++ * 소재 1개 → 5변형 블로그 글 자동 생성 (정보·후기·Q&A·비교·체크리스트).
++ * stub: 운영 환경에 LLM 키 있으면 실 호출로 교체.
++ */
++import { NextRequest, NextResponse } from 'next/server';
++
++export const runtime = 'nodejs';
++
++interface Body {
++  topic?: string;
++  brief?: string;
++}
++
++const VARIANTS = [
++  { format: 'info', label: '정보형', cue: '정보 가이드 · 800자 내외' },
++  { format: 'review', label: '후기형', cue: '환자 후기 톤 · 600자' },
++  { format: 'qa', label: 'Q&A', cue: 'FAQ 자동 변환 · 5문항' },
++  { format: 'compare', label: '비교형', cue: '비용·회복기·후유증 비교 · 표 포함' },
++  { format: 'checklist', label: '체크리스트', cue: '수술 전·중·후 체크리스트' }
++] as const;
++
++export async function POST(req: NextRequest) {
++  const body = (await req.json().catch(() => ({}))) as Body;
++  const topic = (body.topic ?? '').trim();
++  if (!topic) {
++    return NextResponse.json({ ok: false, error: 'topic is required' }, { status: 400 });
++  }
++  const brief = body.brief ?? `${topic} 관련 소재. 메디맵 자동 발행 파이프라인 대상.`;
++  const posts = VARIANTS.map((v, i) => ({
++    id: `gen-${Date.now()}-${i}`,
++    variantNo: i + 1,
++    formatLabel: v.label,
++    cue: v.cue,
++    status: 'draft' as const,
++    title: `${topic} ${v.label} 글 — 메디맵 자동 발행`,
++    lead: `${topic}에 대한 ${v.label} 형식. ${brief}`,
++    body: `메디맵 등록 병원·시술 데이터를 기반으로 작성된 ${v.label} 본문. 의료법 9 룰 린터 통과 필요. 실제 운영 시 LLM 호출 결과로 대체.`,
++    bullets: v.format === 'checklist' ? ['수술 전 검진', '회복기 관리', '재진 예약'] : undefined,
++    keywords: [topic, '메디맵'],
++    readMinutes: 4,
++    charCount: 1280
++  }));
++  return NextResponse.json({
++    ok: true,
++    topic,
++    brief,
++    posts,
++    note: process.env.LLM_PROVIDER ?? 'stub'
++  });
++}
+diff --git a/src/app/api/simulator/compare/route.ts b/src/app/api/simulator/compare/route.ts
+new file mode 100755
+index 0000000..362cba3
+--- /dev/null
++++ b/src/app/api/simulator/compare/route.ts
+@@ -0,0 +1,63 @@
++/**
++ * POST /api/simulator/compare
++ *
++ * AI 응답 시뮬레이터 — 4 엔진 동시 호출 BEFORE/AFTER 비교.
++ * 운영 키가 없으면 stub 으로 응답해 페이지가 항상 동작하도록 보장.
++ */
++import { NextRequest, NextResponse } from 'next/server';
++import type { LlmEngine } from '@/lib/types';
++
++export const runtime = 'nodejs';
++
++interface Body {
++  query?: string;
++  /** 사용자가 GEO 데이터 적용 ON/OFF 토글한 경우 */
++  applyGeo?: boolean;
++}
++
++const ENGINES: LlmEngine[] = ['chatgpt', 'claude', 'gemini', 'perplexity'];
++
++function stubResponse(engine: LlmEngine, query: string, applyGeo: boolean) {
++  const accuracyBefore = 58 + ((query.length * 3) % 12);
++  const accuracyAfter = Math.min(98, accuracyBefore + (applyGeo ? 28 : 14));
++  const toneBefore = 60 + ((query.charCodeAt(0) || 70) % 10);
++  const toneAfter = Math.min(96, toneBefore + 20);
++  return {
++    engine,
++    modelLabel: engine === 'chatgpt' ? 'gpt-4o-mini' : engine === 'claude' ? 'claude-sonnet-4.6' : engine === 'gemini' ? 'gemini-1.5-flash' : 'sonar-medium',
++    before: {
++      accuracyScore: accuracyBefore,
++      tonePoint: toneBefore,
++      summary: `${query} — 일반적인 정보 중심 답변, 자사 데이터 없음`,
++      detail: `데이터 피딩 전: ${query}에 대해 일반 의료 정보만 안내. 메디맵 병원 데이터, 가격, 의료진, 위치 정보 미포함.`,
++      tags: ['일반 정보', '병원 비특정'],
++      mentionCount: 0
++    },
++    after: {
++      accuracyScore: accuracyAfter,
++      tonePoint: toneAfter,
++      summary: `${query} — 메디맵 등록 병원 ${Math.floor(Math.random() * 5) + 2}곳 추천 + Schema.org 인용`,
++      detail: `데이터 피딩 후: 메디맵에 등록된 의료진 프로필·시술별 가격·위치를 기반으로 정확하게 응답. JSON-LD 인용 표기.`,
++      tags: ['메디맵 인용', '가격 명시', '의료진 명시'],
++      mentionCount: applyGeo ? Math.floor(Math.random() * 4) + 2 : Math.floor(Math.random() * 2) + 1
++    },
++    deltaPoint: accuracyAfter - accuracyBefore
++  };
++}
++
++export async function POST(req: NextRequest) {
++  const body = (await req.json().catch(() => ({}))) as Body;
++  const query = (body.query ?? '').trim();
++  const applyGeo = body.applyGeo ?? true;
++  if (!query) {
++    return NextResponse.json({ ok: false, error: 'query is required' }, { status: 400 });
++  }
++  const responses = ENGINES.map((e) => stubResponse(e, query, applyGeo));
++  return NextResponse.json({
++    ok: true,
++    query,
++    askedAt: new Date().toISOString(),
++    responses,
++    note: process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY ? 'stub (env keys 보유 — 다음 단계에서 실 호출로 교체 예정)' : 'stub'
++  });
++}
+diff --git a/src/app/api/video/generate/route.ts b/src/app/api/video/generate/route.ts
+new file mode 100755
+index 0000000..8f1b7fb
+--- /dev/null
++++ b/src/app/api/video/generate/route.ts
+@@ -0,0 +1,69 @@
++/**
++ * POST /api/video/generate
++ *
++ * 영상 스크립트 자동 합성 (Shorts/Reels/YouTube 3종).
++ */
++import { NextRequest, NextResponse } from 'next/server';
++
++export const runtime = 'nodejs';
++
++interface Body {
++  topic?: string;
++}
++
++export async function POST(req: NextRequest) {
++  const body = (await req.json().catch(() => ({}))) as Body;
++  const topic = (body.topic ?? '').trim();
++  if (!topic) {
++    return NextResponse.json({ ok: false, error: 'topic is required' }, { status: 400 });
++  }
++  const scripts = [
++    {
++      id: `gen-shorts-${Date.now()}`,
++      channel: 'shorts',
++      duration: '0:45',
++      status: 'draft',
++      title: `${topic} 핵심 30초 (Shorts)`,
++      hook: `"${topic}" 진짜 정보 30초 정리`,
++      beats: [
++        { start: '00:00', line: '문제 제시 — 환자 페인포인트' },
++        { start: '00:08', line: `${topic} 핵심 사실 1` },
++        { start: '00:20', line: `${topic} 핵심 사실 2` },
++        { start: '00:32', line: '메디맵 등록 병원 추천 멘트' }
++      ],
++      cta: '댓글에 지역명 → AI가 가까운 병원 매칭'
++    },
++    {
++      id: `gen-reels-${Date.now()}`,
++      channel: 'reels',
++      duration: '0:30',
++      status: 'draft',
++      title: `${topic} 비포애프터 (Reels)`,
++      hook: `"${topic}" 후기 한 컷 정리`,
++      beats: [
++        { start: '00:00', line: 'BEFORE 컷' },
++        { start: '00:10', line: 'AFTER 컷 + 텍스트 오버레이' },
++        { start: '00:22', line: '메디맵 링크 + 톡톡' }
++      ],
++      cta: '프로필 링크 — 메디맵 톡톡 상담'
++    },
++    {
++      id: `gen-yt-${Date.now()}`,
++      channel: 'youtube',
++      duration: '3:30',
++      status: 'draft',
++      title: `${topic} 환자가 진짜 궁금한 5가지 (YouTube)`,
++      hook: `${topic} — 의사가 직접 답변`,
++      beats: [
++        { start: '00:00', line: '인트로 + 질문 5개 소개' },
++        { start: '00:30', line: 'Q1 비용' },
++        { start: '01:10', line: 'Q2 회복기' },
++        { start: '01:50', line: 'Q3 부작용' },
++        { start: '02:30', line: 'Q4 의료진 선택 기준' },
++        { start: '03:00', line: 'Q5 메디맵 활용법 + 아웃트로' }
++      ],
++      cta: '구독 + 더 알아보기: medi-map.co.kr'
++    }
++  ];
++  return NextResponse.json({ ok: true, topic, scripts });
++}
+diff --git a/src/app/blog/page.tsx b/src/app/blog/page.tsx
+index a392d60..44ba39f 100644
+--- a/src/app/blog/page.tsx
++++ b/src/app/blog/page.tsx
+@@ -4,20 +4,14 @@
+  */
+ 'use client';
+ 
+-import { useState } from 'react';
++import { useMemo, useState } from 'react';
+ import { Copy, Download, Edit3, Send, Sparkles } from 'lucide-react';
+ import { Header } from '@/components/Header';
+-import { blogStats, contentTopics } from '@/lib/mock-data';
++import { blogStats, contentTopics as baseTopics } from '@/lib/mock-data';
+ import { formatKstDateTime } from '@/lib/format';
+ import { cn } from '@/lib/cn';
+-import type { PublishStatus } from '@/lib/types';
+-
+-const KPIS = [
+-  { label: '이번 달 생성 소재', value: blogStats.topicsThisMonth, suffix: '개' },
+-  { label: '누적 블로그 글', value: blogStats.totalPosts, suffix: '건' },
+-  { label: '배포 완료', value: blogStats.distributed, suffix: '건' },
+-  { label: '검수 대기', value: blogStats.reviewing, suffix: '건' }
+-];
++import { copyToClipboard, downloadMarkdownBundle, showToast } from '@/lib/clientActions';
++import type { BlogPostVariant, ContentTopic, PublishStatus } from '@/lib/types';
+ 
+ const STATUS_CHIP: Record<PublishStatus, { label: string; cls: string }> = {
+   draft: { label: '초안', cls: 'chip-warning' },
+@@ -35,8 +29,102 @@ const BADGE_CHIP: Record<string, string> = {
+ };
+ 
+ export default function BlogPage() {
+-  const [activeTopicId, setActiveTopicId] = useState(contentTopics[0].id);
+-  const active = contentTopics.find((t) => t.id === activeTopicId)!;
++  const [topics, setTopics] = useState<ContentTopic[]>(baseTopics);
++  const [activeTopicId, setActiveTopicId] = useState(baseTopics[0].id);
++  const [newTopic, setNewTopic] = useState('');
++  const [generating, setGenerating] = useState(false);
++
++  const active = useMemo(
++    () => topics.find((t) => t.id === activeTopicId) ?? topics[0],
++    [topics, activeTopicId]
++  );
++
++  const KPIS = [
++    { label: '이번 달 생성 소재', value: blogStats.topicsThisMonth, suffix: '개' },
++    { label: '누적 블로그 글', value: blogStats.totalPosts, suffix: '건' },
++    { label: '배포 완료', value: blogStats.distributed, suffix: '건' },
++    { label: '검수 대기', value: blogStats.reviewing, suffix: '건' }
++  ];
++
++  const onGenerate = async () => {
++    const topic = newTopic.trim();
++    if (!topic) {
++      showToast('소재를 입력하세요', { kind: 'error' });
++      return;
++    }
++    setGenerating(true);
++    try {
++      const res = await fetch('/api/blog/generate', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ topic })
++      });
++      const data = await res.json();
++      if (!data.ok) throw new Error(data.error ?? 'generate failed');
++      const newId = `topic-gen-${Date.now()}`;
++      const created: ContentTopic = {
++        id: newId,
++        label: topic,
++        badge: '수술정보',
++        brief: data.brief,
++        posts: data.posts.map((p: any) => ({
++          ...p,
++          topicId: newId,
++          format: p.format ?? 'info'
++        })) as BlogPostVariant[],
++        createdAt: new Date().toISOString()
++      };
++      setTopics((prev) => [created, ...prev]);
++      setActiveTopicId(newId);
++      setNewTopic('');
++      showToast(`5글 생성 완료 — ${topic.slice(0, 18)}`);
++    } catch (err) {
++      showToast(`오류: ${(err as Error).message}`, { kind: 'error' });
++    } finally {
++      setGenerating(false);
++    }
++  };
++
++  const copyPost = async (post: BlogPostVariant) => {
++    const md = [
++      `# ${post.title}`,
++      '',
++      post.lead,
++      '',
++      post.body ?? '',
++      ...(post.bullets ? ['', ...post.bullets.map((b) => `- ${b}`)] : [])
++    ].join('\n');
++    const ok = await copyToClipboard(md);
++    showToast(ok ? '본문 복사됨 (markdown)' : '복사 실패', { kind: ok ? 'success' : 'error' });
++  };
++
++  const onBundleDownload = () => {
++    if (!active || active.posts.length === 0) {
++      showToast('이 소재에 발행 글이 없습니다', { kind: 'error' });
++      return;
++    }
++    downloadMarkdownBundle(
++      `medimap-${active.label.replace(/\s+/g, '-')}.md`,
++      active.posts.map((p) => ({ title: p.title, body: `${p.lead}\n\n${p.body ?? ''}` }))
++    );
++    showToast('5글 .md 묶음 다운로드 시작');
++  };
++
++  const onNaverPublish = (postId: string) => {
++    setTopics((prev) =>
++      prev.map((t) =>
++        t.id !== activeTopicId
++          ? t
++          : {
++              ...t,
++              posts: t.posts.map((p) =>
++                p.id === postId ? { ...p, status: 'published' as PublishStatus } : p
++              )
++            }
++      )
++    );
++    showToast('네이버 발행 대기열에 추가됨 (운영 환경 연동 시 즉시 발행)');
++  };
+ 
+   return (
+     <>
+@@ -57,30 +145,36 @@ export default function BlogPage() {
+         ))}
+       </section>
+ 
+-      {/* 소재 입력 */}
+       <section className="px-8">
+         <div className="card flex items-center gap-3 px-5 py-4">
+           <input
+             className="input-base"
+-            placeholder="새 소재 입력 (예: 인구건조증 관리 방법, 노안 초기 증상...)"
++            placeholder="새 소재 입력 (예: 안구건조증 관리 방법, 노안 초기 증상...)"
++            value={newTopic}
++            onChange={(e) => setNewTopic(e.target.value)}
++            onKeyDown={(e) => e.key === 'Enter' && !generating && onGenerate()}
++            disabled={generating}
+           />
+-          <button type="button" className="btn-primary shrink-0">
+-            <Sparkles className="h-4 w-4" /> 소재 + 5글 생성
++          <button
++            type="button"
++            onClick={onGenerate}
++            disabled={generating}
++            className="btn-primary shrink-0 disabled:opacity-60"
++          >
++            <Sparkles className="h-4 w-4" /> {generating ? '생성 중…' : '소재 + 5글 생성'}
+           </button>
+         </div>
+       </section>
+ 
+-      {/* 좌우 분할 */}
+       <section className="grid grid-cols-1 gap-6 px-8 py-6 lg:grid-cols-[380px_1fr]">
+-        {/* 좌: 생성된 소재 리스트 */}
+         <aside className="card">
+           <header className="flex items-center justify-between border-b border-border px-5 py-4">
+-            <h2 className="section-title">생성된 소재 ({contentTopics.length})</h2>
++            <h2 className="section-title">생성된 소재 ({topics.length})</h2>
+             <span className="section-subtle">1소재 = 5글</span>
+           </header>
+           <ul className="divide-y divide-border">
+-            {contentTopics.map((t) => {
+-              const active = t.id === activeTopicId;
++            {topics.map((t) => {
++              const isActive = t.id === activeTopicId;
+               const fillCount = t.posts.length;
+               return (
+                 <li key={t.id}>
+@@ -89,7 +183,7 @@ export default function BlogPage() {
+                     onClick={() => setActiveTopicId(t.id)}
+                     className={cn(
+                       'w-full px-5 py-4 text-left transition',
+-                      active ? 'bg-brand-50' : 'hover:bg-surface-subtle'
++                      isActive ? 'bg-brand-50' : 'hover:bg-surface-subtle'
+                     )}
+                   >
+                     <div className="mb-1 flex items-center justify-between gap-2">
+@@ -118,7 +212,6 @@ export default function BlogPage() {
+           </p>
+         </aside>
+ 
+-        {/* 우: 5글 변형 카드 */}
+         <div className="card">
+           <header className="flex items-center justify-between border-b border-border px-6 py-5">
+             <div>
+@@ -126,14 +219,14 @@ export default function BlogPage() {
+               <h2 className="mt-1 text-lg font-bold text-ink">{active.label}</h2>
+               <p className="mt-1 text-xs text-ink-muted">{active.brief}</p>
+             </div>
+-            <button type="button" className="btn-secondary text-xs">
++            <button type="button" onClick={onBundleDownload} className="btn-secondary text-xs">
+               <Download className="h-3.5 w-3.5" /> 5글 일괄 다운로드 (.md)
+             </button>
+           </header>
+ 
+           {active.posts.length === 0 ? (
+             <div className="px-6 py-12 text-center text-sm text-ink-muted">
+-              아직 생성된 글이 없습니다. 우측 상단 ‘5글 생성’으로 자동 작성하세요.
++              아직 생성된 글이 없습니다. 우측 상단 '5글 생성'으로 자동 작성하세요.
+             </div>
+           ) : (
+             <ul className="divide-y divide-border">
+@@ -156,9 +249,7 @@ export default function BlogPage() {
+                       <h3 className="text-base font-bold text-ink">{p.title}</h3>
+                       <p className="mt-2 text-sm leading-relaxed text-ink-soft">{p.lead}</p>
+ 
+-                      {p.body && (
+-                        <p className="mt-3 text-sm leading-relaxed text-ink-soft">{p.body}</p>
+-                      )}
++                      {p.body && <p className="mt-3 text-sm leading-relaxed text-ink-soft">{p.body}</p>}
+                       {p.bullets && (
+                         <ul className="mt-3 space-y-1.5 text-sm text-ink-soft">
+                           {p.bullets.map((b, i) => (
+@@ -184,14 +275,23 @@ export default function BlogPage() {
+                     </div>
+ 
+                     <div className="flex shrink-0 flex-col items-end gap-2">
+-                      <button type="button" className="btn-secondary text-xs">
++                      <button
++                        type="button"
++                        onClick={() => showToast('편집 기능은 차후 발행 워크플로에 통합 예정', { kind: 'info' })}
++                        className="btn-secondary text-xs"
++                      >
+                         <Edit3 className="h-3.5 w-3.5" /> 편집
+                       </button>
+-                      <button type="button" className="btn-secondary text-xs">
++                      <button type="button" onClick={() => copyPost(p)} className="btn-secondary text-xs">
+                         <Copy className="h-3.5 w-3.5" /> 본문 복사
+                       </button>
+-                      <button type="button" className="btn-primary text-xs">
+-                        <Send className="h-3.5 w-3.5" /> 네이버 발행
++                      <button
++                        type="button"
++                        onClick={() => onNaverPublish(p.id)}
++                        disabled={p.status === 'published'}
++                        className="btn-primary text-xs disabled:opacity-60"
++                      >
++                        <Send className="h-3.5 w-3.5" /> {p.status === 'published' ? '발행됨' : '네이버 발행'}
+                       </button>
+                     </div>
+                   </div>
+diff --git a/src/app/data-feeding/page.tsx b/src/app/data-feeding/page.tsx
+index 7e0b4a7..5287ddb 100644
+--- a/src/app/data-feeding/page.tsx
++++ b/src/app/data-feeding/page.tsx
+@@ -4,7 +4,7 @@
+  */
+ 'use client';
+ 
+-import { useMemo, useState } from 'react';
++import { useEffect, useMemo, useState } from 'react';
+ import {
+   BadgePercent,
+   ChevronRight,
+@@ -22,6 +22,9 @@ import { Header } from '@/components/Header';
+ import { feedingCategories, feedingFields, currentTenant } from '@/lib/mock-data';
+ import type { FeedingCategoryId } from '@/lib/types';
+ import { cn } from '@/lib/cn';
++import { showToast } from '@/lib/clientActions';
++
++const LS_KEY = 'medimap-geo:data-feeding:v1';
+ 
+ const iconMap = {
+   Stethoscope,
+@@ -43,9 +46,28 @@ const STATUS_CHIP = {
+ 
+ export default function DataFeedingPage() {
+   const [activeCat, setActiveCat] = useState<FeedingCategoryId>('doctor');
++  const [panelOpen, setPanelOpen] = useState(true);
++  const [values, setValues] = useState<Record<string, string>>({});
++  const [saving, setSaving] = useState(false);
++
++  useEffect(() => {
++    if (typeof window === 'undefined') return;
++    try {
++      const raw = window.localStorage.getItem(LS_KEY);
++      if (raw) setValues(JSON.parse(raw));
++    } catch {
++      /* noop */
++    }
++  }, []);
++
++  const persistedCount = useMemo(
++    () => Object.values(values).filter((v) => v && v.trim().length > 0).length,
++    [values]
++  );
+ 
+   const totalFields = feedingCategories.reduce((s, c) => s + c.totalFields, 0);
+-  const filledFields = feedingCategories.reduce((s, c) => s + c.filledFields, 0);
++  const baseFilled = feedingCategories.reduce((s, c) => s + c.filledFields, 0);
++  const filledFields = Math.min(totalFields, baseFilled + persistedCount);
+   const progress = Math.round((filledFields / totalFields) * 100);
+ 
+   const expertise = feedingCategories.filter((c) => c.group === 'expertise');
+@@ -62,6 +84,34 @@ export default function DataFeedingPage() {
+   const activeCatMeta = feedingCategories.find((c) => c.id === activeCat)!;
+   const nextField = fields.find((f) => f.required) ?? fields[0];
+ 
++  const onChangeField = (id: string, val: string) => setValues((prev) => ({ ...prev, [id]: val }));
++
++  const onPreview = () => {
++    const filled = fields.filter((f) => (values[f.id] ?? '').trim().length > 0);
++    if (filled.length === 0) {
++      showToast('입력값이 없습니다. 먼저 필드를 채워주세요', { kind: 'error' });
++      return;
++    }
++    showToast(`미리 검수 — ${filled.length}/${fields.length} 필드 입력됨`, { kind: 'info' });
++  };
++
++  const onSave = async (e: React.FormEvent) => {
++    e.preventDefault();
++    const requiredMissing = fields.filter((f) => f.required && !(values[f.id] ?? '').trim());
++    if (requiredMissing.length > 0) {
++      showToast(`필수 필드 누락: ${requiredMissing.map((f) => f.label).join(', ')}`, { kind: 'error' });
++      return;
++    }
++    setSaving(true);
++    try {
++      window.localStorage.setItem(LS_KEY, JSON.stringify(values));
++      await new Promise((r) => setTimeout(r, 280));
++      showToast(`${activeCatMeta.title} 저장됨 — AI 프로필 완성도 ${progress}%`);
++    } finally {
++      setSaving(false);
++    }
++  };
++
+   return (
+     <>
+       <Header
+@@ -73,7 +123,6 @@ export default function DataFeedingPage() {
+         ]}
+       />
+ 
+-      {/* 상단 진행률 영역 */}
+       <section className="grid grid-cols-1 gap-6 px-8 py-6 lg:grid-cols-[260px_1fr_280px]">
+         <div className="card card-pad">
+           <div className="kpi-label">AI 프로필 완성도</div>
+@@ -109,7 +158,6 @@ export default function DataFeedingPage() {
+         </div>
+       </section>
+ 
+-      {/* 카테고리 리스트 + 입력 패널 */}
+       <section className="grid grid-cols-1 gap-6 px-8 pb-10 lg:grid-cols-[480px_1fr]">
+         <div className="card">
+           <div className="flex items-center justify-between border-b border-border px-5 py-4">
+@@ -124,7 +172,10 @@ export default function DataFeedingPage() {
+                 <li key={c.id}>
+                   <button
+                     type="button"
+-                    onClick={() => setActiveCat(c.id)}
++                    onClick={() => {
++                      setActiveCat(c.id);
++                      setPanelOpen(true);
++                    }}
+                     className={cn(
+                       'flex w-full items-center gap-3 px-5 py-4 text-left transition hover:bg-surface-subtle',
+                       active && 'bg-brand-50'
+@@ -153,45 +204,73 @@ export default function DataFeedingPage() {
+           </ul>
+         </div>
+ 
+-        <div className="card">
+-          <div className="flex items-start justify-between border-b border-border px-6 py-5">
+-            <div>
+-              <h2 className="text-sm font-bold text-ink">{activeCatMeta.title}</h2>
+-              <p className="mt-1 text-xs text-ink-muted">{activeCatMeta.summary}</p>
+-            </div>
+-            <button type="button" className="rounded-md p-1 text-ink-muted hover:bg-surface-muted">
+-              <X className="h-4 w-4" />
+-            </button>
+-          </div>
+-
+-          <form className="space-y-5 px-6 py-6">
+-            {fields.length === 0 && (
+-              <p className="text-sm text-ink-muted">이 카테고리의 필드는 곧 추가됩니다.</p>
+-            )}
+-            {fields.map((f) => (
+-              <div key={f.id}>
+-                <label className="mb-1 block text-xs font-semibold text-ink">
+-                  {f.label}
+-                  {f.required && <span className="ml-1 text-status-danger">*</span>}
+-                </label>
+-                {f.type === 'textarea' ? (
+-                  <textarea className="input-base min-h-[110px] resize-y" placeholder={f.placeholder} />
+-                ) : (
+-                  <input className="input-base" placeholder={f.placeholder} />
+-                )}
++        {panelOpen ? (
++          <div className="card">
++            <div className="flex items-start justify-between border-b border-border px-6 py-5">
++              <div>
++                <h2 className="text-sm font-bold text-ink">{activeCatMeta.title}</h2>
++                <p className="mt-1 text-xs text-ink-muted">{activeCatMeta.summary}</p>
+               </div>
+-            ))}
+-
+-            <div className="flex items-center justify-end gap-2 border-t border-border pt-5">
+-              <button type="button" className="btn-secondary">
+-                미리 검수
+-              </button>
+-              <button type="submit" className="btn-primary">
+-                + {activeCatMeta.title} 추가
++              <button
++                type="button"
++                onClick={() => setPanelOpen(false)}
++                aria-label="입력 패널 닫기"
++                className="rounded-md p-1 text-ink-muted hover:bg-surface-muted"
++              >
++                <X className="h-4 w-4" />
+               </button>
+             </div>
+-          </form>
+-        </div>
++
++            <form className="space-y-5 px-6 py-6" onSubmit={onSave}>
++              {fields.length === 0 && (
++                <p className="text-sm text-ink-muted">이 카테고리의 필드는 곧 추가됩니다.</p>
++              )}
++              {fields.map((f) => (
++                <div key={f.id}>
++                  <label className="mb-1 block text-xs font-semibold text-ink">
++                    {f.label}
++                    {f.required && <span className="ml-1 text-status-danger">*</span>}
++                  </label>
++                  {f.type === 'textarea' ? (
++                    <textarea
++                      className="input-base min-h-[110px] resize-y"
++                      placeholder={f.placeholder}
++                      value={values[f.id] ?? ''}
++                      onChange={(e) => onChangeField(f.id, e.target.value)}
++                    />
++                  ) : (
++                    <input
++                      className="input-base"
++                      placeholder={f.placeholder}
++                      value={values[f.id] ?? ''}
++                      onChange={(e) => onChangeField(f.id, e.target.value)}
++                    />
++                  )}
++                </div>
++              ))}
++
++              <div className="flex items-center justify-end gap-2 border-t border-border pt-5">
++                <button type="button" onClick={onPreview} className="btn-secondary">
++                  미리 검수
++                </button>
++                <button type="submit" disabled={saving} className="btn-primary disabled:opacity-60">
++                  {saving ? '저장 중…' : `+ ${activeCatMeta.title} 추가`}
++                </button>
++              </div>
++            </form>
++          </div>
++        ) : (
++          <div className="card flex h-full min-h-[160px] items-center justify-center px-6 py-8 text-sm text-ink-muted">
++            패널이 닫혔습니다 —
++            <button
++              type="button"
++              onClick={() => setPanelOpen(true)}
++              className="ml-2 font-semibold text-brand-700 underline"
++            >
++              다시 열기
++            </button>
++          </div>
++        )}
+       </section>
+     </>
+   );
+diff --git a/src/app/faq/page.tsx b/src/app/faq/page.tsx
+index 3b97068..3291ee1 100644
+--- a/src/app/faq/page.tsx
++++ b/src/app/faq/page.tsx
+@@ -1,17 +1,18 @@
+ /**
+  * FAQ & Q&A 텍스트 — Schema.org FAQ 자동 변환.
+- * 사용자 목표(LLM 인용)에 가장 직접적인 페이지 — AI 모델은 Q/A 매칭을 최우선 선호.
++ * 사용자 목표(LLM 인용)에 가장 직접적인 페이지.
+  */
+ 'use client';
+ 
+-import { useState } from 'react';
++import { useMemo, useState } from 'react';
+ import { ClipboardCheck, Copy, FilePlus2, Filter, ShieldCheck } from 'lucide-react';
+ import { Header } from '@/components/Header';
+-import { faqItems } from '@/lib/mock-data';
++import { faqItems as baseFaqItems } from '@/lib/mock-data';
+ import { faqPageSchema } from '@/lib/aeo';
+ import { formatKstDateTime } from '@/lib/format';
+ import { cn } from '@/lib/cn';
+-import type { PublishStatus } from '@/lib/types';
++import { copyToClipboard, showToast } from '@/lib/clientActions';
++import type { FaqItem, PublishStatus } from '@/lib/types';
+ 
+ const STATUS_CHIP: Record<PublishStatus, { label: string; cls: string }> = {
+   draft: { label: '초안', cls: 'chip-warning' },
+@@ -20,24 +21,70 @@ const STATUS_CHIP: Record<PublishStatus, { label: string; cls: string }> = {
+   archived: { label: '보관됨', cls: 'chip-neutral' }
+ };
+ 
+-const KPIS = [
+-  { label: '총 FAQ', value: faqItems.length, suffix: '건' },
+-  { label: '발행 완료', value: faqItems.filter((q) => q.status === 'published').length, suffix: '건' },
+-  { label: 'Schema 적용', value: faqItems.filter((q) => q.schemaReady).length, suffix: '건' },
+-  { label: 'AI 생성', value: faqItems.filter((q) => q.generatedBy !== 'manual').length, suffix: '건' }
+-];
+-
+ export default function FaqPage() {
+   const [filter, setFilter] = useState<'all' | PublishStatus>('all');
+-  const visible = filter === 'all' ? faqItems : faqItems.filter((q) => q.status === filter);
++  const [items, setItems] = useState<FaqItem[]>(baseFaqItems);
++  const [adding, setAdding] = useState(false);
++  const [newKeyword, setNewKeyword] = useState('');
++  const [showAddModal, setShowAddModal] = useState(false);
++
++  const visible = filter === 'all' ? items : items.filter((q) => q.status === filter);
++
++  const kpis = useMemo(
++    () => [
++      { label: '총 FAQ', value: items.length, suffix: '건' },
++      { label: '발행 완료', value: items.filter((q) => q.status === 'published').length, suffix: '건' },
++      { label: 'Schema 적용', value: items.filter((q) => q.schemaReady).length, suffix: '건' },
++      { label: 'AI 생성', value: items.filter((q) => q.generatedBy !== 'manual').length, suffix: '건' }
++    ],
++    [items]
++  );
+ 
+   const copyFaqJsonLd = async () => {
+-    const payload = faqPageSchema(faqItems);
++    const payload = faqPageSchema(items);
+     const wrapped = `<script type="application/ld+json">\n${JSON.stringify(payload, null, 2)}\n</script>`;
++    const ok = await copyToClipboard(wrapped);
++    showToast(ok ? `FAQPage Schema ${items.length}건 복사됨` : '복사 실패', {
++      kind: ok ? 'success' : 'error'
++    });
++  };
++
++  const copyAnswer = async (q: FaqItem) => {
++    const ok = await copyToClipboard(`Q. ${q.question}\nA. ${q.answer}`);
++    showToast(ok ? '본문 복사됨' : '복사 실패', { kind: ok ? 'success' : 'error' });
++  };
++
++  const setStatus = (id: string, status: PublishStatus) => {
++    setItems((prev) =>
++      prev.map((q) => (q.id === id ? { ...q, status, updatedAt: new Date().toISOString() } : q))
++    );
++    const label = status === 'published' ? '발행' : status === 'review' ? '검수 중' : '초안';
++    showToast(`${label}으로 변경됨`);
++  };
++
++  const generateFromAi = async (kw: string) => {
++    const keyword = kw.trim();
++    if (!keyword) {
++      showToast('키워드를 입력하세요', { kind: 'error' });
++      return;
++    }
++    setAdding(true);
+     try {
+-      await navigator.clipboard.writeText(wrapped);
+-    } catch {
+-      /* noop */
++      const res = await fetch('/api/faq/generate', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ keyword, count: 3 })
++      });
++      const data = await res.json();
++      if (!data.ok) throw new Error('failed');
++      setItems((prev) => [...data.generated, ...prev]);
++      setShowAddModal(false);
++      setNewKeyword('');
++      showToast(`${data.generated.length}건 FAQ 추가됨`);
++    } catch (err) {
++      showToast(`오류: ${(err as Error).message}`, { kind: 'error' });
++    } finally {
++      setAdding(false);
+     }
+   };
+ 
+@@ -51,7 +98,7 @@ export default function FaqPage() {
+       />
+ 
+       <section className="grid grid-cols-1 gap-4 px-8 py-6 sm:grid-cols-2 lg:grid-cols-4">
+-        {KPIS.map((k) => (
++        {kpis.map((k) => (
+           <div key={k.label} className="card card-pad">
+             <div className="kpi-label">{k.label}</div>
+             <div className="kpi-value">
+@@ -84,7 +131,11 @@ export default function FaqPage() {
+                   {s === 'all' ? '전체' : STATUS_CHIP[s].label}
+                 </button>
+               ))}
+-              <button type="button" className="btn-primary text-xs ml-2">
++              <button
++                type="button"
++                onClick={() => setShowAddModal(true)}
++                className="btn-primary text-xs ml-2"
++              >
+                 <FilePlus2 className="h-3.5 w-3.5" /> AI로 FAQ 추가
+               </button>
+             </div>
+@@ -120,13 +171,24 @@ export default function FaqPage() {
+                     </div>
+                   </div>
+                   <div className="flex shrink-0 flex-col items-end gap-2">
+-                    <button type="button" className="btn-secondary text-xs">
++                    <button type="button" onClick={() => copyAnswer(q)} className="btn-secondary text-xs">
+                       <Copy className="h-3.5 w-3.5" /> 본문 복사
+                     </button>
+-                    <button type="button" className="btn-secondary text-xs">
++                    <button
++                      type="button"
++                      onClick={() => setStatus(q.id, 'review')}
++                      className="btn-secondary text-xs"
++                    >
+                       <ClipboardCheck className="h-3.5 w-3.5" /> 검수
+                     </button>
+-                    <button type="button" className="btn-primary text-xs">발행</button>
++                    <button
++                      type="button"
++                      onClick={() => setStatus(q.id, 'published')}
++                      disabled={q.status === 'published'}
++                      className="btn-primary text-xs disabled:opacity-60"
++                    >
++                      {q.status === 'published' ? '발행됨' : '발행'}
++                    </button>
+                   </div>
+                 </div>
+               </li>
+@@ -134,6 +196,48 @@ export default function FaqPage() {
+           </ul>
+         </div>
+       </section>
++
++      {showAddModal && (
++        <div
++          className="fixed inset-0 z-[1000] flex items-center justify-center bg-ink/60 p-4"
++          onClick={() => !adding && setShowAddModal(false)}
++        >
++          <div className="card w-full max-w-md" onClick={(e) => e.stopPropagation()}>
++            <div className="border-b border-border px-6 py-4">
++              <h3 className="text-base font-bold text-ink">AI로 FAQ 추가</h3>
++              <p className="mt-1 text-xs text-ink-muted">키워드를 입력하면 3건의 FAQ 초안이 자동 생성됩니다.</p>
++            </div>
++            <div className="space-y-4 px-6 py-5">
++              <input
++                className="input-base"
++                placeholder="예: 잠실 라섹, 강남안과 노안교정..."
++                value={newKeyword}
++                onChange={(e) => setNewKeyword(e.target.value)}
++                onKeyDown={(e) => e.key === 'Enter' && generateFromAi(newKeyword)}
++                autoFocus
++              />
++            </div>
++            <div className="flex items-center justify-end gap-2 border-t border-border px-6 py-4">
++              <button
++                type="button"
++                onClick={() => setShowAddModal(false)}
++                disabled={adding}
++                className="btn-secondary text-xs"
++              >
++                취소
++              </button>
++              <button
++                type="button"
++                onClick={() => generateFromAi(newKeyword)}
++                disabled={adding}
++                className="btn-primary text-xs disabled:opacity-60"
++              >
++                {adding ? '생성 중…' : '3건 생성'}
++              </button>
++            </div>
++          </div>
++        </div>
++      )}
+     </>
+   );
+ }
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index daf5913..121db27 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -2,6 +2,7 @@
+  * 통합 대시보드 & AI 모니터링 — 메인 화면.
+  * Figma 시안(node 804:386) IA 100% 싱크로.
+  */
++'use client';
+ 
+ import { Header } from '@/components/Header';
+ import { KpiGrid } from '@/components/KpiCard';
+@@ -13,6 +14,7 @@ import { OverallSentimentBars } from '@/components/charts/OverallSentimentBars';
+ import { KeywordOptimizationTable } from '@/components/tables/KeywordOptimizationTable';
+ import { LiveFeedPanel } from '@/components/feed/LiveFeedPanel';
+ import { TopicsTable } from '@/components/tables/TopicsTable';
++import { printCurrentPage, showToast } from '@/lib/clientActions';
+ import {
+   aiInsightBanner,
+   engineMetrics,
+@@ -27,10 +29,12 @@ import {
+   visibilityKpis
+ } from '@/lib/mock-data';
+ 
+-export const dynamic = 'force-static';
+-export const revalidate = 60;
+-
+ export default function DashboardPage() {
++  const handlePdf = () => {
++    showToast('PDF 인쇄 다이얼로그 — "PDF로 저장" 선택', { kind: 'info', ms: 3000 });
++    setTimeout(() => printCurrentPage(), 280);
++  };
++
+   return (
+     <>
+       <Header
+@@ -41,6 +45,7 @@ export default function DashboardPage() {
+           { label: '데이터 피딩', href: '/data-feeding' }
+         ]}
+         actionLabel="PDF 다운로드"
++        onAction={handlePdf}
+       />
+ 
+       <div className="space-y-6 px-8 py-6">
+diff --git a/src/app/simulator/page.tsx b/src/app/simulator/page.tsx
+index d7f1bd0..c0cd9d2 100644
+--- a/src/app/simulator/page.tsx
++++ b/src/app/simulator/page.tsx
+@@ -1,14 +1,17 @@
+ /**
+- * AI 응답 시뮬레이터 — BEFORE / AFTER 3-패널 비교.
++ * AI 응답 시뮬레이터 — BEFORE / AFTER 비교 (4 엔진 동시 호출).
+  * Figma 시안(node 804:396) IA 100% 싱크로.
+  */
++'use client';
+ 
++import { useState } from 'react';
+ import { Send, Sparkles } from 'lucide-react';
+ import { Header } from '@/components/Header';
+ import { simulatorSuggestions, simulatorThreads, simulatorTurns } from '@/lib/mock-data';
+ import { formatRelative } from '@/lib/format';
+ import { cn } from '@/lib/cn';
+-import type { LlmEngine } from '@/lib/types';
++import { showToast } from '@/lib/clientActions';
++import type { LlmEngine, SimulatorTurn } from '@/lib/types';
+ 
+ const ENGINE_LABEL: Record<LlmEngine, { name: string; brand: string }> = {
+   chatgpt: { name: 'ChatGPT', brand: 'GPT' },
+@@ -24,11 +27,49 @@ const ENGINE_TONE: Record<LlmEngine, string> = {
+   perplexity: 'bg-engine-perplexity'
+ };
+ 
+-export const dynamic = 'force-static';
+-
+ export default function SimulatorPage() {
+-  const activeThread = simulatorThreads[0];
+-  const turns = simulatorTurns.filter((t) => t.threadId === activeThread.id);
++  const [activeThreadId, setActiveThreadId] = useState(simulatorThreads[0].id);
++  const [extraTurns, setExtraTurns] = useState<SimulatorTurn[]>([]);
++  const [input, setInput] = useState('');
++  const [loading, setLoading] = useState(false);
++
++  const activeThread = simulatorThreads.find((t) => t.id === activeThreadId) ?? simulatorThreads[0];
++  const baseTurns = simulatorTurns.filter((t) => t.threadId === activeThread.id);
++  const turns = [...baseTurns, ...extraTurns.filter((t) => t.threadId === activeThread.id)];
++
++  const onSend = async (e?: React.FormEvent) => {
++    e?.preventDefault();
++    const q = input.trim();
++    if (!q) {
++      showToast('질문을 입력하세요', { kind: 'error' });
++      return;
++    }
++    setLoading(true);
++    try {
++      const res = await fetch('/api/simulator/compare', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ query: q, applyGeo: true })
++      });
++      const data = await res.json();
++      if (!data.ok) throw new Error(data.error ?? 'compare failed');
++      const newTurn: SimulatorTurn = {
++        id: `turn-${Date.now()}`,
++        threadId: activeThread.id,
++        speaker: 'user',
++        query: q,
++        askedAt: data.askedAt,
++        responses: data.responses
++      };
++      setExtraTurns((prev) => [...prev, newTurn]);
++      setInput('');
++      showToast(`4 엔진 비교 완료 — ${q.slice(0, 18)}…`);
++    } catch (err) {
++      showToast(`오류: ${(err as Error).message}`, { kind: 'error' });
++    } finally {
++      setLoading(false);
++    }
++  };
+ 
+   return (
+     <>
+@@ -42,16 +83,16 @@ export default function SimulatorPage() {
+       />
+ 
+       <section className="grid grid-cols-1 gap-0 px-8 py-6 lg:grid-cols-[280px_1fr]">
+-        {/* 최근 대화 사이드 패널 */}
+         <aside className="rounded-l-xl border border-r-0 border-border bg-surface-base p-5">
+           <h2 className="mb-4 text-xs font-semibold uppercase tracking-wider text-ink-muted">최근 대화</h2>
+           <ul className="space-y-2">
+             {simulatorThreads.map((thr) => {
+-              const active = thr.id === activeThread.id;
++              const active = thr.id === activeThreadId;
+               return (
+                 <li key={thr.id}>
+                   <button
+                     type="button"
++                    onClick={() => setActiveThreadId(thr.id)}
+                     className={cn(
+                       'w-full rounded-lg border px-3 py-3 text-left transition',
+                       active ? 'border-brand-200 bg-brand-50' : 'border-transparent hover:bg-surface-subtle'
+@@ -74,7 +115,6 @@ export default function SimulatorPage() {
+           </ul>
+         </aside>
+ 
+-        {/* 메인 시뮬레이터 */}
+         <div className="rounded-r-xl border border-border bg-surface-base">
+           <header className="flex items-center justify-between border-b border-border px-6 py-4">
+             <div className="flex items-center gap-2">
+@@ -91,6 +131,9 @@ export default function SimulatorPage() {
+                 <span className="inline-flex items-center gap-1">
+                   <span className="h-2 w-2 rounded-sm bg-engine-gemini" /> Gemini
+                 </span>
++                <span className="inline-flex items-center gap-1">
++                  <span className="h-2 w-2 rounded-sm bg-engine-perplexity" /> Perplexity
++                </span>
+               </div>
+             </div>
+             <div className="flex items-center gap-2 text-xs">
+@@ -100,14 +143,13 @@ export default function SimulatorPage() {
+               <span className="inline-flex items-center gap-1 rounded-md bg-brand-50 px-2 py-1 text-brand-700">
+                 <span className="h-2 w-2 rounded-sm bg-brand" /> GEO 적용 후
+               </span>
+-              <span className="text-ink-muted">3개 대화 턴</span>
++              <span className="text-ink-muted">{turns.length}개 대화 턴</span>
+             </div>
+           </header>
+ 
+           <div className="px-6 py-6">
+             {turns.map((turn) => (
+               <div key={turn.id} className="mb-8 last:mb-0">
+-                {/* 사용자 발화 */}
+                 <div className="mb-4 flex justify-end">
+                   <div className="max-w-xl rounded-2xl bg-brand px-4 py-3 text-sm text-white">
+                     <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-brand-100">
+@@ -117,9 +159,8 @@ export default function SimulatorPage() {
+                   </div>
+                 </div>
+ 
+-                {/* 3-패널 응답 */}
+                 {turn.responses && (
+-                  <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
++                  <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
+                     {turn.responses.map((r) => (
+                       <div key={r.engine} className="overflow-hidden rounded-lg border border-border">
+                         <header className="flex items-center justify-between border-b border-border bg-surface-subtle px-4 py-3">
+@@ -135,7 +176,6 @@ export default function SimulatorPage() {
+                           <span className="text-xs font-bold text-status-success">↑ +{r.deltaPoint}점</span>
+                         </header>
+ 
+-                        {/* BEFORE */}
+                         <div className="border-b border-border bg-surface-subtle px-4 py-3">
+                           <div className="mb-1 flex items-center justify-between text-[11px]">
+                             <span className="font-bold uppercase tracking-wider text-ink-muted">BEFORE · GEO 적용 전</span>
+@@ -157,7 +197,6 @@ export default function SimulatorPage() {
+                           </div>
+                         </div>
+ 
+-                        {/* AFTER */}
+                         <div className="border-l-4 border-brand bg-brand-50/40 px-4 py-3">
+                           <div className="mb-1 flex items-center justify-between text-[11px]">
+                             <span className="font-bold uppercase tracking-wider text-brand-700">AFTER · GEO 적용 후</span>
+@@ -184,33 +223,44 @@ export default function SimulatorPage() {
+                 )}
+               </div>
+             ))}
++            {turns.length === 0 && (
++              <div className="rounded-xl border border-dashed border-border px-6 py-12 text-center text-sm text-ink-muted">
++                아직 대화가 없습니다. 아래에 질문을 입력해 4 엔진 비교를 시작하세요.
++              </div>
++            )}
+           </div>
+ 
+-          {/* 추천 질문 */}
+           <div className="border-t border-border px-6 py-4">
+             <div className="flex flex-wrap items-center gap-2 text-xs">
+               <span className="font-semibold text-ink-muted">추천 질문</span>
+               {simulatorSuggestions.map((s) => (
+-                <button key={s} type="button" className="rounded-full border border-border bg-surface-base px-3 py-1.5 text-ink-soft hover:border-brand-200 hover:text-brand-700">
++                <button
++                  key={s}
++                  type="button"
++                  onClick={() => setInput(s)}
++                  className="rounded-full border border-border bg-surface-base px-3 py-1.5 text-ink-soft hover:border-brand-200 hover:text-brand-700"
++                >
+                   ✨ {s}
+                 </button>
+               ))}
+             </div>
+           </div>
+ 
+-          {/* 입력창 */}
+           <div className="border-t border-border px-6 py-4">
+-            <form className="flex items-center gap-3">
++            <form className="flex items-center gap-3" onSubmit={onSend}>
+               <input
+                 className="input-base"
+-                placeholder="GEO 데이터를 학습한 AI에게 질문하세요. (Shift+Enter 줄바꿈)"
++                placeholder="GEO 데이터를 학습한 AI에게 질문하세요. (Enter로 전송)"
++                value={input}
++                onChange={(e) => setInput(e.target.value)}
++                disabled={loading}
+               />
+-              <button type="submit" className="btn-primary">
+-                <Send className="h-4 w-4" /> 전송
++              <button type="submit" disabled={loading} className="btn-primary disabled:opacity-60">
++                <Send className="h-4 w-4" /> {loading ? '비교 중…' : '전송'}
+               </button>
+             </form>
+             <div className="mt-2 inline-flex items-center gap-2 text-xs text-ink-muted">
+-              <Sparkles className="h-3 w-3 text-brand" /> GEO 데이터 86% 적용 중
++              <Sparkles className="h-3 w-3 text-brand" /> GEO 데이터 86% 적용 중 · 4 엔진 동시 호출
+             </div>
+           </div>
+         </div>
+diff --git a/src/app/video/page.tsx b/src/app/video/page.tsx
+index 477a527..5ea03f9 100644
+--- a/src/app/video/page.tsx
++++ b/src/app/video/page.tsx
+@@ -2,10 +2,15 @@
+  * 영상 스크립트 — Shorts / Reels / YouTube 자동 합성.
+  * 사용자 목표 보강: 영상 컨텐츠는 메타·캡션 텍스트로 LLM 인덱싱.
+  */
++'use client';
++
++import { useState } from 'react';
+ import { Clapperboard, Copy, Send, Sparkles } from 'lucide-react';
+ import { Header } from '@/components/Header';
+-import { videoScripts } from '@/lib/mock-data';
++import { videoScripts as baseScripts } from '@/lib/mock-data';
+ import { cn } from '@/lib/cn';
++import { copyToClipboard, showToast } from '@/lib/clientActions';
++import type { VideoScript } from '@/lib/types';
+ 
+ const CHANNEL_LABEL: Record<string, string> = {
+   shorts: 'YouTube Shorts',
+@@ -25,9 +30,56 @@ const STATUS_LABEL: Record<string, string> = {
+   archived: '보관됨'
+ };
+ 
+-export const dynamic = 'force-static';
+-
+ export default function VideoScriptPage() {
++  const [scripts, setScripts] = useState<VideoScript[]>(baseScripts);
++  const [topic, setTopic] = useState('');
++  const [generating, setGenerating] = useState(false);
++
++  const onGenerate = async () => {
++    const t = topic.trim();
++    if (!t) {
++      showToast('소재를 입력하세요', { kind: 'error' });
++      return;
++    }
++    setGenerating(true);
++    try {
++      const res = await fetch('/api/video/generate', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ topic: t })
++      });
++      const data = await res.json();
++      if (!data.ok) throw new Error(data.error ?? 'failed');
++      setScripts((prev) => [...data.scripts, ...prev]);
++      setTopic('');
++      showToast(`스크립트 ${data.scripts.length}개 생성됨 (Shorts/Reels/YouTube)`);
++    } catch (err) {
++      showToast(`오류: ${(err as Error).message}`, { kind: 'error' });
++    } finally {
++      setGenerating(false);
++    }
++  };
++
++  const copyScript = async (v: VideoScript) => {
++    const md = [
++      `# ${v.title}`,
++      `채널: ${CHANNEL_LABEL[v.channel]} · ${v.duration}`,
++      '',
++      `Hook — ${v.hook}`,
++      '',
++      ...v.beats.map((b) => `${b.start}  ${b.line}`),
++      '',
++      `CTA — ${v.cta}`
++    ].join('\n');
++    const ok = await copyToClipboard(md);
++    showToast(ok ? '스크립트 복사됨' : '복사 실패', { kind: ok ? 'success' : 'error' });
++  };
++
++  const onUpload = (id: string) => {
++    setScripts((prev) => prev.map((v) => (v.id === id ? { ...v, status: 'published' } : v)));
++    showToast('채널 업로드 대기열에 추가됨 (운영 환경 연동 시 즉시 업로드)');
++  };
++
+   return (
+     <>
+       <Header
+@@ -37,15 +89,27 @@ export default function VideoScriptPage() {
+ 
+       <section className="px-8 py-6">
+         <div className="card flex items-center gap-3 px-5 py-4">
+-          <input className="input-base" placeholder="새 영상 소재 입력 (예: 라섹 회복기 시간대별 컨디션, 다초점 렌즈 후기...)" />
+-          <button type="button" className="btn-primary shrink-0">
+-            <Sparkles className="h-4 w-4" /> 스크립트 생성
++          <input
++            className="input-base"
++            placeholder="새 영상 소재 입력 (예: 라섹 회복기 시간대별 컨디션, 다초점 렌즈 후기...)"
++            value={topic}
++            onChange={(e) => setTopic(e.target.value)}
++            onKeyDown={(e) => e.key === 'Enter' && !generating && onGenerate()}
++            disabled={generating}
++          />
++          <button
++            type="button"
++            onClick={onGenerate}
++            disabled={generating}
++            className="btn-primary shrink-0 disabled:opacity-60"
++          >
++            <Sparkles className="h-4 w-4" /> {generating ? '생성 중…' : '스크립트 생성'}
+           </button>
+         </div>
+       </section>
+ 
+       <section className="grid grid-cols-1 gap-5 px-8 pb-10 lg:grid-cols-2">
+-        {videoScripts.map((v) => (
++        {scripts.map((v) => (
+           <article key={v.id} className="card">
+             <header className="flex items-center justify-between border-b border-border px-5 py-4">
+               <div className="flex items-center gap-2">
+@@ -68,7 +132,9 @@ export default function VideoScriptPage() {
+               <ol className="mt-4 space-y-2">
+                 {v.beats.map((b, i) => (
+                   <li key={i} className="grid grid-cols-[56px_1fr] items-baseline gap-3 text-sm text-ink-soft">
+-                    <span className="rounded bg-surface-muted px-1.5 py-0.5 text-center font-mono text-xs text-ink-muted">{b.start}</span>
++                    <span className="rounded bg-surface-muted px-1.5 py-0.5 text-center font-mono text-xs text-ink-muted">
++                      {b.start}
++                    </span>
+                     <span>{b.line}</span>
+                   </li>
+                 ))}
+@@ -78,11 +144,16 @@ export default function VideoScriptPage() {
+               </div>
+             </div>
+             <div className="flex items-center justify-end gap-2 border-t border-border px-5 py-3">
+-              <button type="button" className="btn-secondary text-xs">
++              <button type="button" onClick={() => copyScript(v)} className="btn-secondary text-xs">
+                 <Copy className="h-3.5 w-3.5" /> 스크립트 복사
+               </button>
+-              <button type="button" className="btn-primary text-xs">
+-                <Send className="h-3.5 w-3.5" /> 채널 업로드
++              <button
++                type="button"
++                onClick={() => onUpload(v.id)}
++                disabled={v.status === 'published'}
++                className="btn-primary text-xs disabled:opacity-60"
++              >
++                <Send className="h-3.5 w-3.5" /> {v.status === 'published' ? '업로드됨' : '채널 업로드'}
+               </button>
+             </div>
+           </article>
+diff --git a/src/lib/clientActions.ts b/src/lib/clientActions.ts
+new file mode 100755
+index 0000000..4c51c05
+--- /dev/null
++++ b/src/lib/clientActions.ts
+@@ -0,0 +1,127 @@
++/**
++ * 클라이언트 사이드 액션 — 클립보드/파일 다운로드/PDF 인쇄 공통 유틸.
++ *
++ * 모든 페이지의 "복사" / "다운로드" / "PDF" 버튼이 일관된 UX로 동작하도록 한다.
++ */
++
++export async function copyToClipboard(text: string): Promise<boolean> {
++  try {
++    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
++      await navigator.clipboard.writeText(text);
++      return true;
++    }
++  } catch {
++    /* fallthrough */
++  }
++  try {
++    // 구식 fallback (HTTP, iframe 등 clipboard API 미허용 환경)
++    const ta = document.createElement('textarea');
++    ta.value = text;
++    ta.style.position = 'fixed';
++    ta.style.opacity = '0';
++    document.body.appendChild(ta);
++    ta.select();
++    const ok = document.execCommand('copy');
++    document.body.removeChild(ta);
++    return ok;
++  } catch {
++    return false;
++  }
++}
++
++export function downloadBlob(filename: string, blob: Blob): void {
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement('a');
++  a.href = url;
++  a.download = filename;
++  document.body.appendChild(a);
++  a.click();
++  document.body.removeChild(a);
++  setTimeout(() => URL.revokeObjectURL(url), 1000);
++}
++
++export function downloadText(filename: string, text: string, mime = 'text/plain;charset=utf-8'): void {
++  downloadBlob(filename, new Blob([text], { type: mime }));
++}
++
++export function downloadJsonLdHtml(filename: string, payloads: unknown[]): void {
++  const json = JSON.stringify(payloads, null, 2);
++  const html = `<!doctype html>
++<html lang="ko">
++<head>
++<meta charset="utf-8">
++<title>MEDIMAP GEO — JSON-LD</title>
++<script type="application/ld+json">
++${json}
++</script>
++</head>
++<body>
++<h1>MEDIMAP GEO — Schema.org JSON-LD</h1>
++<p>위 &lt;script&gt; 블록을 병원 홈페이지 &lt;head&gt; 영역에 그대로 복사해 넣으세요.</p>
++<pre>${escapeHtml(json)}</pre>
++</body>
++</html>`;
++  downloadText(filename, html, 'text/html;charset=utf-8');
++}
++
++export function downloadMarkdownBundle(filename: string, posts: Array<{ title: string; body: string }>): void {
++  const md = posts
++    .map((p, i) => `# ${String(i + 1).padStart(2, '0')}. ${p.title}\n\n${p.body}`)
++    .join('\n\n---\n\n');
++  downloadText(filename, md, 'text/markdown;charset=utf-8');
++}
++
++function escapeHtml(s: string): string {
++  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
++}
++
++export function printCurrentPage(): void {
++  if (typeof window !== 'undefined') window.print();
++}
++
++/**
++ * 미니 토스트 — 의존성 없는 1줄 알림. 같은 메시지는 디바운스.
++ * (radix/sonner 같은 라이브러리 도입 전까지 임시.)
++ */
++const TOAST_ID = 'medimap-geo-toast';
++export function showToast(message: string, opts?: { kind?: 'success' | 'error' | 'info'; ms?: number }): void {
++  if (typeof document === 'undefined') return;
++  const kind = opts?.kind ?? 'success';
++  const ms = opts?.ms ?? 2400;
++  let el = document.getElementById(TOAST_ID);
++  if (!el) {
++    el = document.createElement('div');
++    el.id = TOAST_ID;
++    el.style.cssText = [
++      'position:fixed',
++      'left:50%',
++      'bottom:24px',
++      'transform:translateX(-50%)',
++      'z-index:99999',
++      'padding:10px 18px',
++      'border-radius:12px',
++      'box-shadow:0 10px 30px rgba(15,23,42,.18)',
++      'font-size:13px',
++      'font-weight:600',
++      'letter-spacing:-0.01em',
++      'opacity:0',
++      'transition:opacity .18s ease, transform .18s ease',
++      'pointer-events:none'
++    ].join(';');
++    document.body.appendChild(el);
++  }
++  const tone = kind === 'error' ? '#FEE2E2;color:#991B1B' : kind === 'info' ? '#E0F2FE;color:#075985' : '#CCFBF1;color:#0F766E';
++  el.setAttribute('style', el.getAttribute('style') + `;background:${tone}`);
++  el.textContent = message;
++  requestAnimationFrame(() => {
++    if (!el) return;
++    el.style.opacity = '1';
++    el.style.transform = 'translateX(-50%) translateY(-4px)';
++  });
++  window.clearTimeout((el as any).__hideTimer);
++  (el as any).__hideTimer = window.setTimeout(() => {
++    if (!el) return;
++    el.style.opacity = '0';
++    el.style.transform = 'translateX(-50%) translateY(0)';
++  }, ms);
++}
+-- 
+2.34.1
+
